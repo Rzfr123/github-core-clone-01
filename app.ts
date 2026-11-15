@@ -4,7 +4,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
   Store, Repo, VIEWER_LOGIN, VIEWER_ID, VIEWER_EMAIL, ZERO_OID, gid, decodeGid, tsFor,
-  parseCommit, repoJson, issueJson, pullJson, labelJson, commentJson, lineCount, userJson, mergeConflictOf,
+  parseCommit, repoJson, issueJson, issueJsonText, pullJson, labelJson, commentJson, lineCount, userJson, mergeConflictOf,
 } from './store.ts';
 import {
   pkt, pktLines, FLUSH, decodePackets, v0Advertisement, v2Advertisement, lsRefsResponse,
@@ -23,6 +23,13 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extra: Rec
   const text = status === 204 ? '' : `${JSON.stringify(body)}\n`;
   const headers: Record<string, string> = { 'x-github-request-id': `req-${++requestCounter}`, ...extra };
   if (status !== 204) { headers['content-type'] = JSON_TYPE; headers['content-length'] = String(Buffer.byteLength(text)); }
+  res.writeHead(status, headers);
+  res.end(text);
+}
+/** Send an already-serialized JSON text (with its trailing newline) without re-stringifying:
+ *  the hot single-issue GET serves its memoized text through here. */
+function sendText(res: ServerResponse, status: number, text: string, extra: Record<string, string> = {}): void {
+  const headers: Record<string, string> = { 'x-github-request-id': `req-${++requestCounter}`, 'content-type': JSON_TYPE, 'content-length': String(Buffer.byteLength(text)), ...extra };
   res.writeHead(status, headers);
   res.end(text);
 }
@@ -55,8 +62,16 @@ async function readJsonBody(req: IncomingMessage, res: ServerResponse): Promise<
   try { return JSON.parse(raw.toString('utf8')) as Json; }
   catch { errJson(res, 400, 'Problems parsing JSON'); return null; }
 }
+/** One URL parse per request: pathParts, queryOf and pageLink all ask for the same URL, and the
+ *  hot read workload pays that parse 2,000 times — the request object is the cache key. */
+const urlCache = new WeakMap<IncomingMessage, URL>();
 function urlOf(req: IncomingMessage): URL {
-  return new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+  let u = urlCache.get(req);
+  if (u === undefined) {
+    u = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+    urlCache.set(req, u);
+  }
+  return u;
 }
 function pathParts(req: IncomingMessage): string[] {
   return urlOf(req).pathname.split('/').filter((p) => p !== '');
@@ -374,7 +389,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, parts: stri
     if (rest.length === 2) {
       const issue = issueByNumber(repo, num);
       if (!issue) { errJson(res, 404, 'Not Found'); return; }
-      if (method === 'GET') { sendJson(res, 200, issueJson(repo, issue)); return; }
+      if (method === 'GET') { sendText(res, 200, issueJsonText(repo, issue)); return; }
       if (method === 'PATCH') {
         const body = await readJsonBody(req, res);
         if (body === null) return;
@@ -384,6 +399,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, parts: stri
           issue.state = body.state;
           issue.closedSeq = body.state === 'closed' ? store.nextSeq() : null;
         }
+        repo.invalidateIssueText(num);
         sendJson(res, 200, issueJson(repo, issue)); return;
       }
       errJson(res, 404, 'Not Found'); return;
@@ -397,6 +413,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, parts: stri
         if (body === null) return;
         const c = { id: repo.nextCommentId++, gid: gid('IssueComment', repo.id, repo.nextCommentId), body: typeof body?.body === 'string' ? body.body : '', createdSeq: store.nextSeq() };
         const list = repo.comments.get(num) ?? []; list.push(c); repo.comments.set(num, list);
+        repo.invalidateIssueText(num); // the issue's comment count changed
         sendJson(res, 201, commentJson(repo, num, c)); return;
       }
       errJson(res, 404, 'Not Found'); return;
@@ -777,6 +794,7 @@ function executeOp(op: GqlOp): { data: Json; errors: Array<{ message: string }> 
           const issue = repo?.issues.get(dec?.num ?? 0);
           if (!repo || !issue) { ctx.errors.push({ message: 'Issue not found' }); data[s.alias] = null; break; }
           issue.state = 'closed'; issue.closedSeq = store.nextSeq();
+          repo.invalidateIssueText(issue.number);
           data[s.alias] = { issue: resolveIssueFields(repo, issue, s.selections[0]?.selections ?? [], ctx) };
           break;
         }
@@ -807,6 +825,7 @@ function executeOp(op: GqlOp): { data: Json; errors: Array<{ message: string }> 
           if (!repo || !issue) { ctx.errors.push({ message: 'Issue not found' }); data[s.alias] = null; break; }
           const c = { id: repo.nextCommentId++, gid: gid('IssueComment', repo.id, repo.nextCommentId), body: String(input.body ?? ''), createdSeq: store.nextSeq() };
           const list = repo.comments.get(issue.number) ?? []; list.push(c); repo.comments.set(issue.number, list);
+          repo.invalidateIssueText(issue.number); // the issue's comment count changed
           data[s.alias] = { commentEdge: { node: { id: c.gid, body: c.body } } };
           break;
         }

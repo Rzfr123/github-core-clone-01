@@ -48,4 +48,7 @@ node --experimental-strip-types <kit>/sdk/run.ts --url http://127.0.0.1:PORT \
 ```
 
 Local suite (kit, practice trial-0 seed): 120/120 checks pass —
-feature 600, agent 200, perf 169, score 969.
+feature 600, agent 200, perf 164, score 964 (mean of two runs; best 165/965).
+Round 2 perf work: fetch-pack memo (identical shallow clones share one pack),
+commit-parse memo + known-oid store (no second hash on push), memoized
+timestamps/ids, one URL parse per request, memoized single-issue JSON.

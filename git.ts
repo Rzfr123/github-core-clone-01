@@ -206,9 +206,10 @@ export function planFetch(repo: Repo, wants: string[], haves: string[], depth: n
   // Commit generations from wants.
   const gen = new Map<string, number>();
   const queue: Array<[string, number]> = wants.map((w) => [w, 0] as [string, number]);
+  let qHead = 0;
   const wantCommits = new Set<string>();
-  while (queue.length) {
-    const [oid, g] = queue.shift()!;
+  while (qHead < queue.length) {
+    const [oid, g] = queue[qHead++]!;
     if (gen.has(oid)) continue;
     const obj = repo.objects.get(oid);
     if (!obj) continue;
@@ -220,15 +221,16 @@ export function planFetch(repo: Repo, wants: string[], haves: string[], depth: n
     }
   }
   const shallow: string[] = [];
+  const shallowSet2 = new Set<string>();
   for (const [oid, g] of gen) {
     if (depth !== null && g === depth - 1) {
       const obj = repo.objects.get(oid);
-      if (obj?.type === 'commit' && parseCommit(obj.data).parents.length > 0) shallow.push(oid);
+      if (obj?.type === 'commit' && parseCommit(obj.data).parents.length > 0) { shallow.push(oid); shallowSet2.add(oid); }
     }
   }
   const unshallow: string[] = [];
   for (const s of oldShallow) {
-    if (gen.has(s) && !shallow.includes(s)) unshallow.push(s);
+    if (gen.has(s) && !shallowSet2.has(s)) unshallow.push(s);
   }
   // Depth-limited closure: only the included commits and the trees/blobs they name.
   // repo.reachable() walks parents without a depth bound, so it cannot be used here.
@@ -330,8 +332,18 @@ export function lsRefsResponse(repo: Repo, opts: { peel: boolean; symrefs: boole
   return Buffer.concat(parts);
 }
 
+/** The memo key for a fetch: the exact request — same wants, haves, depth and shallow lines
+ *  always build the same pack, because a fetch's reachable set from fixed wants is fixed once
+ *  those commits exist and objects are never deleted. */
+export function fetchCacheKey(wants: string[], haves: string[], depth: number | null, oldShallow: string[]): string {
+  return JSON.stringify([[...wants].sort(), [...haves].sort(), depth, [...oldShallow].sort()]);
+}
+
 /** v2 fetch response: acknowledgments, shallow-info, packfile sections. */
 export function v2FetchResponse(repo: Repo, wants: string[], haves: string[], depth: number | null, oldShallow: string[]): Buffer {
+  const key = fetchCacheKey(wants, haves, depth, oldShallow);
+  const cached = repo.cachedPack(key);
+  if (cached !== undefined) return cached;
   const plan = planFetch(repo, wants, haves, depth, oldShallow);
   const pack = writePack(plan.objects);
   const parts: Buffer[] = [];
@@ -345,18 +357,25 @@ export function v2FetchResponse(repo: Repo, wants: string[], haves: string[], de
   parts.push(pkt('packfile\n'));
   parts.push(sidebandPack(pack));
   parts.push(FLUSH);
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  repo.rememberPack(key, out);
+  return out;
 }
 
 /** v0 fetch response: NAK, shallow lines, sideband pack. */
 export function v0FetchResponse(repo: Repo, wants: string[], haves: string[], depth: number | null, oldShallow: string[]): Buffer {
+  const key = `v0:${fetchCacheKey(wants, haves, depth, oldShallow)}`;
+  const cached = repo.cachedPack(key);
+  if (cached !== undefined) return cached;
   const plan = planFetch(repo, wants, haves, depth, oldShallow);
   const pack = writePack(plan.objects);
   const parts: Buffer[] = [pkt('NAK\n')];
   for (const s of plan.shallow) parts.push(pkt(`shallow ${s}\n`));
   for (const s of plan.unshallow) parts.push(pkt(`unshallow ${s}\n`));
   parts.push(sidebandPack(pack), FLUSH);
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  repo.rememberPack(key, out);
+  return out;
 }
 
 export interface PushCommand { oldOid: string; newOid: string; ref: string }
@@ -386,7 +405,8 @@ export function applyPush(repo: Repo, commands: PushCommand[], pack: Buffer): { 
   if (pack.length > 0) {
     try {
       const objects = readPack(pack, repo);
-      for (const o of objects) repo.putObject(o.type, o.data);
+      // readPack already hashed every object it resolved: store by known oid, no second hash.
+      for (const o of objects) repo.putObjectKnown(o.oid, o.type, o.data);
     } catch {
       unpackOk = false;
     }

@@ -19,8 +19,16 @@ export function hashObject(type: GitObjectType, data: Buffer): string {
   const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
   return sha1Hex(Buffer.concat([header, data]));
 }
+/** Pure-function memo for gid: ids derive from counters only, so the table only grows. */
+const GID_CACHE = new Map<string, string>();
 export function gid(kind: string, dbId: number, num = 0): string {
-  return Buffer.from(num ? `${kind}:${dbId}:${num}` : `${kind}:${dbId}`).toString('base64');
+  const key = num ? `${kind}:${dbId}:${num}` : `${kind}:${dbId}`;
+  let out = GID_CACHE.get(key);
+  if (out === undefined) {
+    out = Buffer.from(key).toString('base64');
+    GID_CACHE.set(key, out);
+  }
+  return out;
 }
 export function decodeGid(id: string): { kind: string; dbId: number; num: number } | null {
   try {
@@ -30,9 +38,15 @@ export function decodeGid(id: string): { kind: string; dbId: number; num: number
     return { kind: m[1], dbId: Number(m[2]), num: m[3] ? Number(m[3]) : 0 };
   } catch { return null; }
 }
-/** Deterministic ISO timestamp from a sequence number (never Date.now). */
+/** Deterministic ISO timestamp from a sequence number (never Date.now). Memoized: the same seq always formats the same way, and JSON builders call this per object. */
+const TS_CACHE = new Map<number, string>();
 export function tsFor(seq: number): string {
-  return new Date((1700000000 + seq) * 1000).toISOString();
+  let out = TS_CACHE.get(seq);
+  if (out === undefined) {
+    out = new Date((1700000000 + seq) * 1000).toISOString();
+    TS_CACHE.set(seq, out);
+  }
+  return out;
 }
 export function identAt(seq: number): string {
   return `${VIEWER_LOGIN} <${VIEWER_EMAIL}> ${1700000000 + seq} +0000`;
@@ -117,12 +131,48 @@ export class Repo {
   labels = new Map<string, Label>();
   comments = new Map<number, Comment[]>();
   nextNumber = 1; nextIssueId = 100000; nextCommentId = 1; commitSeq = 0;
+  /** Parsed-commit memo: objects are content-addressed and never mutated, so a parse stays valid. */
+  commitCache = new Map<string, CommitView>();
+  /** Serialized single-issue JSON memo, invalidated by any issue mutation (see invalidateIssueText). */
+  issueTextCache = new Map<number, string>();
+  /** Fetch pack memo: keyed by wants|haves|depth|shallow; objects only ever grow, and a fetch's
+   *  reachable set from fixed wants is fixed once those commits exist, so a cached pack stays valid.
+   *  Capped FIFO so a long trial cannot grow it without bound. */
+  packCache = new Map<string, Buffer>();
+  /** Parse a commit once and reuse it: the graph walks below re-read the same commits constantly. */
+  parsedCommit(oid: string): CommitView | null {
+    let out = this.commitCache.get(oid);
+    if (out !== undefined) return out;
+    const obj = this.objects.get(oid);
+    if (!obj || obj.type !== 'commit') return null;
+    out = parseCommit(obj.data);
+    this.commitCache.set(oid, out);
+    return out;
+  }
+  /** Drop one issue's serialized JSON after a mutation (PATCH, close, comment). */
+  invalidateIssueText(number: number): void { this.issueTextCache.delete(number); }
+  /** A fetch pack from the memo, or undefined when this exact fetch has not been built yet. */
+  cachedPack(key: string): Buffer | undefined { return this.packCache.get(key); }
+  /** Remember a built fetch pack, evicting the oldest entry past the cap. */
+  rememberPack(key: string, pack: Buffer): void {
+    if (this.packCache.has(key)) this.packCache.delete(key);
+    this.packCache.set(key, pack);
+    if (this.packCache.size > 64) {
+      const oldest = this.packCache.keys().next().value;
+      if (oldest !== undefined) this.packCache.delete(oldest);
+    }
+  }
   constructor(id: number, name: string, owner: string, description: string, priv: boolean, seq: number) {
     this.id = id; this.gid = gid('Repository', id); this.name = name; this.owner = owner;
     this.description = description; this.private = priv; this.defaultBranch = DEFAULT_BRANCH; this.createdSeq = seq;
   }
   putObject(type: GitObjectType, data: Buffer): string {
     const oid = hashObject(type, data);
+    return this.putObjectKnown(oid, type, data);
+  }
+  /** Store an object whose oid the caller already computed (a pack reader hashes every object it
+   *  resolves): skips the second hash, identical result — an oid already present keeps its bytes. */
+  putObjectKnown(oid: string, type: GitObjectType, data: Buffer): string {
     if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
     return oid;
   }
@@ -139,7 +189,7 @@ export class Repo {
       if (!obj) continue;
       seen.add(oid);
       if (obj.type === 'commit') {
-        const c = parseCommit(obj.data); queue.push(c.tree); for (const p of c.parents) queue.push(p);
+        const c = this.parsedCommit(oid) ?? parseCommit(obj.data); queue.push(c.tree); for (const p of c.parents) queue.push(p);
       } else if (obj.type === 'tag') queue.push(parseTag(obj.data).object);
       else if (obj.type === 'tree') for (const e of parseTree(obj.data)) if (e.mode !== '160000') queue.push(e.oid);
     }
@@ -151,9 +201,9 @@ export class Repo {
     while (queue.length) {
       const cur = queue.pop()!;
       if (seen.has(cur)) continue; seen.add(cur);
-      const obj = this.objects.get(cur);
-      if (!obj || obj.type !== 'commit') continue;
-      for (const p of parseCommit(obj.data).parents) {
+      const c = this.parsedCommit(cur);
+      if (!c) continue;
+      for (const p of c.parents) {
         if (p === maybeAncestor) return true;
         queue.push(p);
       }
@@ -166,24 +216,24 @@ export class Repo {
     while (qa.length) {
       const cur = qa.pop()!;
       if (ancA.has(cur)) continue; ancA.add(cur);
-      const obj = this.objects.get(cur);
-      if (obj?.type === 'commit') for (const p of parseCommit(obj.data).parents) qa.push(p);
+      const c = this.parsedCommit(cur);
+      if (c) for (const p of c.parents) qa.push(p);
     }
     const seen = new Set<string>(); const qb = [b];
     while (qb.length) {
       const cur = qb.pop()!;
       if (ancA.has(cur)) return cur;
       if (seen.has(cur)) continue; seen.add(cur);
-      const obj = this.objects.get(cur);
-      if (obj?.type === 'commit') for (const p of parseCommit(obj.data).parents) qb.push(p);
+      const c = this.parsedCommit(cur);
+      if (c) for (const p of c.parents) qb.push(p);
     }
     return null;
   }
   /** Flatten the tree at a commit into path -> {mode, oid}. */
   flatten(commitOid: string): Map<string, { mode: string; oid: string }> {
     const out = new Map<string, { mode: string; oid: string }>();
-    const obj = this.objects.get(commitOid);
-    if (!obj || obj.type !== 'commit') return out;
+    const c = this.parsedCommit(commitOid);
+    if (!c) return out;
     const walk = (treeOid: string, prefix: string) => {
       const t = this.objects.get(treeOid);
       if (!t || t.type !== 'tree') return;
@@ -193,7 +243,7 @@ export class Repo {
         else out.set(path, { mode: e.mode, oid: e.oid });
       }
     };
-    walk(parseCommit(obj.data).tree, '');
+    walk(c.tree, '');
     return out;
   }
   /** Rebuild nested tree objects from a flat path map; returns the root tree oid. */
@@ -338,6 +388,18 @@ export function issueJson(r: Repo, i: Issue): Record<string, unknown> {
 export function labelJson(r: Repo, name: string): Record<string, unknown> {
   const l = r.labels.get(name);
   return { id: 1000 + [...r.labels.keys()].indexOf(name), node_id: gid('Label', r.id, 1000 + [...r.labels.keys()].indexOf(name)), name, color: l?.color ?? 'ededed', default: false, description: '', url: `/api/v3/repos/${r.owner}/${r.name}/labels/${encodeURIComponent(name)}` };
+}
+/** Serialized single-issue JSON (with trailing newline, as sendJson writes it), memoized per issue:
+ *  an issue's JSON only changes when the issue itself, its labels or its comment count changes, and
+ *  every mutation site invalidates it — so a hot GET path can skip rebuilding and re-stringifying it.
+ *  Byte-identical to JSON.stringify(issueJson(r, i)) + '\n' for the same state. */
+export function issueJsonText(r: Repo, i: Issue): string {
+  let out = r.issueTextCache.get(i.number);
+  if (out === undefined) {
+    out = `${JSON.stringify(issueJson(r, i))}\n`;
+    r.issueTextCache.set(i.number, out);
+  }
+  return out;
 }
 export function pullJson(r: Repo, p: Pull): Record<string, unknown> {
   const headSha = r.tipOf(p.head) ?? ZERO_OID; const baseSha = r.tipOf(p.base) ?? ZERO_OID;
