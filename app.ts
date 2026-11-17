@@ -4,7 +4,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
   Store, Repo, VIEWER_LOGIN, VIEWER_ID, VIEWER_EMAIL, ZERO_OID, gid, decodeGid, tsFor,
-  parseCommit, repoJson, issueJson, issueJsonText, pullJson, labelJson, commentJson, lineCount, userJson, mergeConflictOf,
+  parseCommit, repoJson, issueJson, issueJsonText, issueJsonBytes, pullJson, labelJson, commentJson, lineCount, userJson, mergeConflictOf,
 } from './store.ts';
 import {
   pkt, pktLines, FLUSH, decodePackets, v0Advertisement, v2Advertisement, lsRefsResponse,
@@ -33,6 +33,13 @@ function sendText(res: ServerResponse, status: number, text: string, extra: Reco
   res.writeHead(status, headers);
   res.end(text);
 }
+/** Send pre-encoded response bytes (with their byte length) without re-encoding or
+ *  re-measuring them: the hot single-issue GET serves its memoized bytes through here. */
+function sendBytes(res: ServerResponse, status: number, b: { buf: Buffer; len: number }, extra: Record<string, string> = {}): void {
+  const headers: Record<string, string> = { 'x-github-request-id': `req-${++requestCounter}`, 'content-type': JSON_TYPE, 'content-length': String(b.len), ...extra };
+  res.writeHead(status, headers);
+  res.end(b.buf);
+}
 function sendRaw(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': String(body.length), 'x-github-request-id': `req-${++requestCounter}` });
   res.end(body);
@@ -51,8 +58,9 @@ function authOk(req: IncomingMessage): boolean {
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    let first: Buffer | null = null;
+    req.on('data', (c: Buffer) => { if (first === null) first = c; else chunks.push(c); });
+    req.on('end', () => resolve(first === null ? Buffer.alloc(0) : chunks.length === 0 ? first : Buffer.concat([first, ...chunks])));
     req.on('error', reject);
   });
 }
@@ -62,8 +70,58 @@ async function readJsonBody(req: IncomingMessage, res: ServerResponse): Promise<
   try { return JSON.parse(raw.toString('utf8')) as Json; }
   catch { errJson(res, 400, 'Problems parsing JSON'); return null; }
 }
-/** One URL parse per request: pathParts, queryOf and pageLink all ask for the same URL, and the
- *  hot read workload pays that parse 2,000 times — the request object is the cache key. */
+/** The raw request target split into its path part and its query string, without building
+ *  a URL object: the suite dials origin-form targets ('/path?query'), and a full URL parse
+ *  costs ~11us a request on the hot paths while a split costs ~1us. An absolute-form
+ *  target (a proxy would send one) falls back to the URL parser. */
+function splitTarget(req: IncomingMessage): { path: string; query: string } | null {
+  let raw = req.url ?? '/';
+  if (!raw.startsWith('/')) return null;
+  // A '#' starts a fragment, which a request target never carries as data (a URL
+  // object strips it from the path and the query alike); drop it before splitting.
+  const frag = raw.indexOf('#');
+  if (frag >= 0) raw = raw.slice(0, frag);
+  const q = raw.indexOf('?');
+  return q < 0 ? { path: raw, query: '' } : { path: raw.slice(0, q), query: raw.slice(q + 1) };
+}
+/** The request's path segments, split on '/' with empty segments dropped — exactly what
+ *  `new URL(...).pathname.split('/').filter(Boolean)` returns for an origin-form target,
+ *  since URL.pathname keeps percent-escapes as-is and the segments are decoded later,
+ *  per segment, by the handlers that need them. */
+const partsCache = new WeakMap<IncomingMessage, string[]>();
+function pathParts(req: IncomingMessage): string[] {
+  let parts = partsCache.get(req);
+  if (parts !== undefined) return parts;
+  const split = splitTarget(req);
+  if (split === null) { parts = urlOf(req).pathname.split('/').filter((p) => p !== ''); }
+  else {
+    parts = [];
+    const path = split.path;
+    let start = 0;
+    for (let i = 0; i <= path.length; i += 1) {
+      if (i === path.length || path[i] === '/') {
+        if (i > start) parts.push(path.slice(start, i));
+        start = i + 1;
+      }
+    }
+  }
+  partsCache.set(req, parts);
+  return parts;
+}
+/** The request's query parameters, parsed from the raw query string alone (URLSearchParams
+ *  parses exactly the string a URL object would hand it). Cached per request: pathParts,
+ *  queryOf and pageLink all ask for the same target. */
+const queryCache = new WeakMap<IncomingMessage, URLSearchParams>();
+function queryOf(req: IncomingMessage): URLSearchParams {
+  let q = queryCache.get(req);
+  if (q !== undefined) return q;
+  const split = splitTarget(req);
+  q = split === null ? urlOf(req).searchParams : new URLSearchParams(split.query);
+  queryCache.set(req, q);
+  return q;
+}
+/** The full URL object, kept only for the pagination Link header (pageLink), which needs
+ *  the origin to build an absolute next-page URL. Every other caller uses the split above. */
 const urlCache = new WeakMap<IncomingMessage, URL>();
 function urlOf(req: IncomingMessage): URL {
   let u = urlCache.get(req);
@@ -73,10 +131,6 @@ function urlOf(req: IncomingMessage): URL {
   }
   return u;
 }
-function pathParts(req: IncomingMessage): string[] {
-  return urlOf(req).pathname.split('/').filter((p) => p !== '');
-}
-function queryOf(req: IncomingMessage): URLSearchParams { return urlOf(req).searchParams; }
 function numParam(q: URLSearchParams, name: string, fallback: number): number {
   const v = q.get(name);
   if (v === null) return fallback;
@@ -380,7 +434,10 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, parts: stri
         const labels: string[] = labelsRaw.map((l: unknown) => typeof l === 'string' ? l : isRecord(l) && typeof l.name === 'string' ? l.name : '').filter(Boolean);
         const created = createIssueIn(repo, title, typeof body?.body === 'string' ? body.body : '', labels);
         if (!created.issue) { errJson(res, created.status, created.message ?? 'Unprocessable'); return; }
-        sendJson(res, 201, created.issue); return;
+        // The create already built the issue object; serve its memoized text instead of
+        // stringifying the same object a second time (identical bytes, one JSON pass saved).
+        const stored = repo.issues.get(created.issue.number as number);
+        sendText(res, 201, stored ? issueJsonText(repo, stored) : `${JSON.stringify(created.issue)}\n`); return;
       }
       errJson(res, 404, 'Not Found'); return;
     }
@@ -389,7 +446,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, parts: stri
     if (rest.length === 2) {
       const issue = issueByNumber(repo, num);
       if (!issue) { errJson(res, 404, 'Not Found'); return; }
-      if (method === 'GET') { sendText(res, 200, issueJsonText(repo, issue)); return; }
+      if (method === 'GET') { sendBytes(res, 200, issueJsonBytes(repo, issue)); return; }
       if (method === 'PATCH') {
         const body = await readJsonBody(req, res);
         if (body === null) return;
@@ -1003,7 +1060,7 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, parts: strin
   if (!repoSeg.endsWith('.git')) { errJson(res, 404, 'Not Found'); return; }
   const repoName = decodeURIComponent(repoSeg.slice(0, -4));
   const repo = owner === VIEWER_LOGIN ? store.getRepo(owner, repoName) : undefined;
-  const service = urlOf(req).searchParams.get('service');
+  const service = queryOf(req).get('service');
   if (method === 'GET' && parts[2] === 'info' && parts[3] === 'refs') {
     if (!repo) { errJson(res, 404, 'Not Found'); return; }
     if (service === 'git-upload-pack') {
@@ -1023,23 +1080,31 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, parts: strin
     try {
       const v2 = (req.headers['git-protocol'] ?? '') === 'version=2';
       if (v2) {
-        const packets = decodePackets(body);
-        const lines = packets.filter((p) => p.kind === 'data').map((p) => p.payload.toString('utf8').replace(/\n$/, ''));
-        const command = lines.find((l) => l.startsWith('command='))?.slice('command='.length);
+        // One pass over the request's lines: the command, wants, haves, shallow lines and
+        // options are each collected as the lines arrive, instead of rescanning the array
+        // once per field (the fetch path used to scan it five times).
+        let command = '';
+        let peel = false; let symrefs = false;
+        const prefixes: string[] = []; const wants: string[] = []; const haves: string[] = []; const shallow: string[] = [];
+        let depth: number | null = null;
+        for (const p of decodePackets(body)) {
+          if (p.kind !== 'data') continue;
+          const line = p.payload.toString('utf8').replace(/\n$/, '');
+          if (line.startsWith('command=')) { if (command === '') command = line.slice('command='.length); }
+          else if (line === 'peel') peel = true;
+          else if (line === 'symrefs') symrefs = true;
+          else if (line.startsWith('ref-prefix ')) prefixes.push(line.slice('ref-prefix '.length));
+          else if (line.startsWith('want ')) wants.push(line.slice(5).trim());
+          else if (line.startsWith('have ')) haves.push(line.slice(5).trim());
+          else if (line.startsWith('shallow ')) shallow.push(line.slice(8).trim());
+          else if (line.startsWith('deepen ')) { const d = Number(line.slice(7)); depth = Number.isFinite(d) ? d : null; }
+        }
         if (command === 'ls-refs') {
-          const peel = lines.includes('peel');
-          const symrefs = lines.includes('symrefs');
-          const prefixes = lines.filter((l) => l.startsWith('ref-prefix ')).map((l) => l.slice('ref-prefix '.length));
           sendRaw(res, 200, lsRefsResponse(repo, { peel, symrefs, prefixes }), 'application/x-git-upload-pack-result');
           return;
         }
         if (command === 'fetch') {
-          const wants = lines.filter((l) => l.startsWith('want ')).map((l) => l.slice(5).trim());
-          const haves = lines.filter((l) => l.startsWith('have ')).map((l) => l.slice(5).trim());
-          const shallow = lines.filter((l) => l.startsWith('shallow ')).map((l) => l.slice(8).trim());
-          const deepenLine = lines.find((l) => l.startsWith('deepen '));
-          const depth = deepenLine ? Number(deepenLine.slice(7)) : null;
-          sendRaw(res, 200, v2FetchResponse(repo, wants, haves, Number.isFinite(depth) ? depth : null, shallow), 'application/x-git-upload-pack-result');
+          sendRaw(res, 200, v2FetchResponse(repo, wants, haves, depth, shallow), 'application/x-git-upload-pack-result');
           return;
         }
         sendRaw(res, 200, FLUSH, 'application/x-git-upload-pack-result');

@@ -135,6 +135,8 @@ export class Repo {
   commitCache = new Map<string, CommitView>();
   /** Serialized single-issue JSON memo, invalidated by any issue mutation (see invalidateIssueText). */
   issueTextCache = new Map<number, string>();
+  /** Pre-encoded bytes of the memoized single-issue JSON (see issueJsonBytes); dropped with it. */
+  issueBytesCache = new Map<number, IssueBytes>();
   /** Fetch pack memo: keyed by wants|haves|depth|shallow; objects only ever grow, and a fetch's
    *  reachable set from fixed wants is fixed once those commits exist, so a cached pack stays valid.
    *  Capped FIFO so a long trial cannot grow it without bound. */
@@ -149,8 +151,8 @@ export class Repo {
     this.commitCache.set(oid, out);
     return out;
   }
-  /** Drop one issue's serialized JSON after a mutation (PATCH, close, comment). */
-  invalidateIssueText(number: number): void { this.issueTextCache.delete(number); }
+  /** Drop one issue's serialized JSON (and its pre-encoded bytes) after a mutation (PATCH, close, comment). */
+  invalidateIssueText(number: number): void { this.issueTextCache.delete(number); this.issueBytesCache.delete(number); }
   /** A fetch pack from the memo, or undefined when this exact fetch has not been built yet. */
   cachedPack(key: string): Buffer | undefined { return this.packCache.get(key); }
   /** Remember a built fetch pack, evicting the oldest entry past the cap. */
@@ -398,6 +400,20 @@ export function issueJsonText(r: Repo, i: Issue): string {
   if (out === undefined) {
     out = `${JSON.stringify(issueJson(r, i))}\n`;
     r.issueTextCache.set(i.number, out);
+  }
+  return out;
+}
+/** Pre-encoded response bytes for a single issue: the memoized text as a Buffer plus its
+ *  byte length, so the hot GET sends bytes without re-encoding the string or re-measuring
+ *  it on every request. The buffer is built once per issue version and dropped together
+ *  with the text memo by invalidateIssueText, so it can never serve a stale issue. */
+export interface IssueBytes { buf: Buffer; len: number }
+export function issueJsonBytes(r: Repo, i: Issue): IssueBytes {
+  let out = r.issueBytesCache.get(i.number);
+  if (out === undefined) {
+    const buf = Buffer.from(issueJsonText(r, i), 'utf8');
+    out = { buf, len: buf.length };
+    r.issueBytesCache.set(i.number, out);
   }
   return out;
 }

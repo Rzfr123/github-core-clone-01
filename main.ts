@@ -177,6 +177,11 @@ async function waitUntilDone(): Promise<void> {
 /** Start the app server on a kernel-chosen port and report which one it got. */
 async function bindServer(): Promise<{ port: number; close: () => void }> {
   const server = createApp();
+  // Keep one connection alive across a whole timed round: the suite drives the read
+  // workload over a single keep-alive socket and the clone workload over fifty at
+  // once, and Node's 5 s default would drop an idle socket mid-round if the suite
+  // ever pauses between calls. 60 s matches the per-check timeouts and costs nothing.
+  server.keepAliveTimeout = 60_000;
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
     server.listen(0, () => resolve());

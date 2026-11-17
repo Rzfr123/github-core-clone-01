@@ -7,9 +7,12 @@ import { ZERO_OID, hashObject, parseCommit, parseTag, parseTree, type GitObjectT
 
 export function pkt(payload: string | Buffer): Buffer {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  const head = Buffer.alloc(4);
-  head.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
-  return Buffer.concat([head, data]);
+  // One buffer for the length head and the payload, instead of concat-ing two:
+  // advertisements and ls-refs build a pkt-line per ref, and the pack framer per chunk.
+  const out = Buffer.allocUnsafe(4 + data.length);
+  out.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  data.copy(out, 4);
+  return out;
 }
 export const FLUSH = Buffer.from('0000', 'ascii');
 export const DELIM = Buffer.from('0001', 'ascii');
@@ -22,14 +25,22 @@ export function pktLines(items: Array<string | Buffer | 'flush' | 'delim'>): Buf
   }
   return Buffer.concat(parts);
 }
-/** Decode a whole pkt-line stream into packets (data payloads + control markers). */
+/** Decode a whole pkt-line stream into packets (data payloads + control markers). The
+ *  4-hex-digit length is validated by hand: the per-packet regex test it replaces cost
+ *  more than the parse itself on the fetch/advertisement paths. */
 export function decodePackets(buf: Buffer): Array<{ kind: 'data' | 'flush' | 'delim' | 'end'; payload: Buffer }> {
   const out: Array<{ kind: 'data' | 'flush' | 'delim' | 'end'; payload: Buffer }> = [];
   let off = 0;
   while (off + 4 <= buf.length) {
-    const hex = buf.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error(`bad pkt-line length ${JSON.stringify(hex)}`);
-    const len = parseInt(hex, 16);
+    let len = 0;
+    let bad = false;
+    for (let i = 0; i < 4; i += 1) {
+      const c = buf[off + i];
+      const d = c >= 48 && c <= 57 ? c - 48 : c >= 97 && c <= 102 ? c - 87 : c >= 65 && c <= 70 ? c - 55 : -1;
+      if (d < 0) { bad = true; break; }
+      len = len * 16 + d;
+    }
+    if (bad) throw new Error(`bad pkt-line length ${JSON.stringify(buf.subarray(off, off + 4).toString('ascii'))}`);
     if (len === 0) { out.push({ kind: 'flush', payload: Buffer.alloc(0) }); off += 4; continue; }
     if (len === 1) { out.push({ kind: 'delim', payload: Buffer.alloc(0) }); off += 4; continue; }
     if (len === 2) { out.push({ kind: 'end', payload: Buffer.alloc(0) }); off += 4; continue; }
@@ -275,8 +286,10 @@ export function sidebandPack(pack: Buffer): Buffer {
 }
 
 // ---------------------------------------------------------------- advertisements
+/** Refs in byte order: plain code-unit comparison is both faster than localeCompare and
+ *  independent of the runtime's locale data, so two runs list refs in the same order. */
 export function sortedRefs(repo: Repo): Array<[string, string]> {
-  return [...repo.refs.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  return [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 }
 export function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const caps = service === 'git-upload-pack'

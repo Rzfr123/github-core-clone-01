@@ -22,7 +22,7 @@ never binds 8080. The bearer token in `MAKEFUN_SHOP_TOKEN` names the viewer
 
 ## Layout
 
-- `main.ts` — lifecycle only (starter code, unchanged).
+- `main.ts` — lifecycle only; keeps a socket alive 60 s across a timed round.
 - `app.ts` — HTTP server: REST v3, GraphQL v4, MCP, git routing.
 - `git.ts` — pkt-line codec, packfile read/write, smart-HTTP handlers.
 - `store.ts` — repositories, git objects, issues, pull requests, merges.
@@ -47,8 +47,14 @@ node --experimental-strip-types <kit>/sdk/run.ts --url http://127.0.0.1:PORT \
   --token "$MAKEFUN_SHOP_TOKEN" --perf
 ```
 
-Local suite (kit, practice trial-0 seed): 120/120 checks pass —
-feature 600, agent 200, perf 164, score 964 (mean of two runs; best 165/965).
-Round 2 perf work: fetch-pack memo (identical shallow clones share one pack),
-commit-parse memo + known-oid store (no second hash on push), memoized
-timestamps/ids, one URL parse per request, memoized single-issue JSON.
+Local suite (kit, practice trial-0 seed): 120/120 checks pass in all four
+round-3 runs — feature 600, agent 200, perf 162–167 (median 164), score
+961–967 (median 964). Round 3 perf work: no `new URL()` on the request path
+(manual split + lazy query parse), pre-encoded single-issue response bytes,
+memoized create-issue response, single-pass v2 fetch parsing, one-buffer
+pkt-lines, hand-checked pkt lengths, byte-order ref sort, single-chunk body
+fast path. Clone is the one workload that moved: p50 142–148 ms (36 pts) vs
+round 2's 154–175 ms (33–35 pts); read/write/push are flat vs round 2, so the
+round-3 margin is small (+0–2, inside run-to-run noise). Round 2's work
+(fetch-pack memo, commit-parse memo, known-oid store, memoized issue JSON)
+still stands underneath.
